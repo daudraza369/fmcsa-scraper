@@ -74,80 +74,80 @@ def get_element_text(driver, xpath, default="NOT FOUND"):
         return default
 
 def process_mc_numbers(mc_numbers, job_id):
-    """Process MC numbers and save results to Excel"""
+    print(f"🚀 Starting job {job_id} with {len(mc_numbers)} MC numbers")
     result_file = os.path.join(TEMP_FOLDER, f"{job_id}.xlsx")
     
-    # Create Excel file
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "FMCSA Authorized Carriers"
-    headers = ["MC Number", "Company Name", "Phone Number", "Physical Address", "Status"]
-    sheet.append(headers)
-    
-    # Set column widths
-    sheet.column_dimensions['A'].width = 15
-    sheet.column_dimensions['B'].width = 30
-    sheet.column_dimensions['C'].width = 20
-    sheet.column_dimensions['D'].width = 50
-    sheet.column_dimensions['E'].width = 25
+    sheet.append(["MC Number", "Company Name", "Phone", "Physical Address", "Status"])
     
     total_found = 0
     
-    for mc in mc_numbers:
-        driver = None
+    for i, mc in enumerate(mc_numbers, 1):
         try:
+            print(f"\n🔍 Processing MC #{i}: {mc}")
             driver = init_driver()
             
-            # Open website and search
-            driver.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
-            WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="2"]'))).click()
+            # Debug: Print Chrome version
+            print(f"🌐 Chrome version: {driver.capabilities['browserVersion']}")
             
-            search_box = WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+            driver.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
+            print("✅ Loaded homepage")
+            
+            # Step 1: Click search type
+            WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, '//*[@id="2"]'))).click()
+            print("✅ Selected search type")
+            
+            # Step 2: Enter MC number
+            search_box = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, '//*[@id="4"]')))
             search_box.clear()
             search_box.send_keys(mc)
+            print(f"✅ Entered MC number: {mc}")
             
-            WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-                EC.presence_of_element_located((By.XPATH, '/html/body/form/p/table/tbody/tr[4]/td/input'))).click()
+            # Step 3: Click search
+            WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, '/html/body/form/p/table/tbody/tr[4]/td/input'))).click()
+            print("✅ Clicked search button")
             
-            # Skip if not found or not authorized
+            # Check for "Not Found"
             try:
-                WebDriverWait(driver, 2).until(
+                WebDriverWait(driver, 3).until(
                     EC.presence_of_element_located((By.XPATH, '//*[contains(text(), "Record Not Found")]')))
+                print(f"❌ MC {mc} not found")
                 continue
             except:
                 pass
-                
+            
+            # Check status
             status = get_element_text(driver, '/html/body/p/table/tbody/tr[2]/td/table/tbody/tr[2]/td/center[1]/table/tbody/tr[8]/td')
+            print(f"📋 Status text: {status}")
+            
             if "AUTHORIZED FOR Property" not in status:
+                print(f"⛔ MC {mc} not authorized")
                 continue
                 
-            # Collect authorized carrier data
+            # Extract data
             result = {
                 "MC Number": mc,
                 "Company Name": get_element_text(driver, '/html/body/p/table/tbody/tr[2]/td/table/tbody/tr[2]/td/center[1]/table/tbody/tr[11]/td'),
                 "Phone": get_element_text(driver, '/html/body/p/table/tbody/tr[2]/td/table/tbody/tr[2]/td/center[1]/table/tbody/tr[14]/td'),
                 "Physical Address": get_element_text(driver, '//*[@id="physicaladdressvalue"]'),
-                "Status": "AUTHORIZED FOR Property"
+                "Status": status
             }
+            print(f"✅ Found data: {result}")
             
-            sheet.append([
-                result["MC Number"],
-                result["Company Name"],
-                result["Phone"],
-                result["Physical Address"],
-                result["Status"]
-            ])
+            sheet.append(list(result.values()))
             total_found += 1
             
         except Exception as e:
-            print(f"Error processing MC {mc}: {str(e)}")
+            print(f"🔥 Error processing MC {mc}: {str(e)}")
         finally:
-            if driver:
-                driver.quit()
+            driver.quit()
     
     workbook.save(result_file)
+    print(f"\n🎉 Saved {total_found} records to {result_file}")
     return {"total_found": total_found, "result_file": result_file}
 
 @app.route('/api/scrape', methods=['POST'])
