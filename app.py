@@ -20,13 +20,16 @@ import atexit
 import shutil
 
 # Configuration
-MAX_THREADS = 10
-PAGE_LOAD_TIMEOUT = 15
-ELEMENT_TIMEOUT = 5
-DELAY_BETWEEN_REQUESTS = 0.15
+os.environ['WDM_LOG_LEVEL'] = '0'  # Disable webdriver-manager logs
+os.environ['WDM_LOCAL'] = '1'      # Use local chromedriver
+MAX_THREADS = 5                    # Reduced for Render's free tier
+PAGE_LOAD_TIMEOUT = 20
+ELEMENT_TIMEOUT = 10
+DELAY_BETWEEN_REQUESTS = 0.5       # Increased delay for stability
 TEMP_FOLDER = "temp_results"
-MAX_REQUESTS_PER_HOUR = 100  # Rate limiting
-CLEANUP_INTERVAL = 3600  # Clean temp files every hour (seconds)
+
+app = Flask(__name__)
+CORS(app)
 
 # Create temp folder if not exists
 if not os.path.exists(TEMP_FOLDER):
@@ -43,43 +46,23 @@ def cleanup_temp_files():
             elif os.path.isdir(file_path):
                 shutil.rmtree(file_path)
 
-# Register cleanup at exit
 atexit.register(cleanup_temp_files)
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Rate limiting storage
-request_counts = {}
-
-# Initialize drivers pool
-driver_pool = queue.Queue(maxsize=MAX_THREADS)
-
-def init_driver_pool():
-    """Initialize a pool of Chrome drivers"""
-    for _ in range(MAX_THREADS):
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--window-size=1920,1080")
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=chrome_options
-        )
-        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-        driver_pool.put(driver)
-
-init_driver_pool()
-
-def get_driver():
-    """Get a driver from the pool"""
-    return driver_pool.get()
-
-def release_driver(driver):
-    """Release a driver back to the pool"""
-    driver_pool.put(driver)
+# Fixed Chrome Driver Initialization
+def init_driver():
+    """Initialize a Chrome driver instance compatible with Render"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    # Fixed ChromeDriver installation for Render
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
 
 def get_element_text(driver, xpath, default="NOT FOUND"):
     """Quick element text extraction with timeout"""
@@ -91,7 +74,7 @@ def get_element_text(driver, xpath, default="NOT FOUND"):
         return default
 
 def process_mc_numbers(mc_numbers, job_id):
-    """Process a list of MC numbers and save results to Excel"""
+    """Process MC numbers and save results to Excel"""
     result_file = os.path.join(TEMP_FOLDER, f"{job_id}.xlsx")
     
     # Create Excel file
@@ -109,11 +92,12 @@ def process_mc_numbers(mc_numbers, job_id):
     sheet.column_dimensions['E'].width = 25
     
     total_found = 0
-    processed = 0
     
     for mc in mc_numbers:
-        driver = get_driver()
+        driver = None
         try:
+            driver = init_driver()
+            
             # Open website and search
             driver.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
             WebDriverWait(driver, ELEMENT_TIMEOUT).until(
@@ -131,14 +115,12 @@ def process_mc_numbers(mc_numbers, job_id):
             try:
                 WebDriverWait(driver, 2).until(
                     EC.presence_of_element_located((By.XPATH, '//*[contains(text(), "Record Not Found")]')))
-                processed += 1
                 continue
             except:
                 pass
                 
             status = get_element_text(driver, '/html/body/p/table/tbody/tr[2]/td/table/tbody/tr[2]/td/center[1]/table/tbody/tr[8]/td')
             if "AUTHORIZED FOR Property" not in status:
-                processed += 1
                 continue
                 
             # Collect authorized carrier data
@@ -157,128 +139,65 @@ def process_mc_numbers(mc_numbers, job_id):
                 result["Physical Address"],
                 result["Status"]
             ])
-            
             total_found += 1
-            processed += 1
             
         except Exception as e:
             print(f"Error processing MC {mc}: {str(e)}")
-            processed += 1
         finally:
-            release_driver(driver)
-        
-        time.sleep(DELAY_BETWEEN_REQUESTS)
+            if driver:
+                driver.quit()
     
     workbook.save(result_file)
-    
-    return {
-        "total_processed": processed,
-        "total_found": total_found,
-        "result_file": result_file
-    }
-
-def check_rate_limit(ip):
-    """Check if the IP has exceeded the rate limit"""
-    now = time.time()
-    if ip not in request_counts:
-        request_counts[ip] = {"count": 1, "timestamp": now}
-        return True
-    
-    # Reset count if last request was more than an hour ago
-    if now - request_counts[ip]["timestamp"] > 3600:
-        request_counts[ip] = {"count": 1, "timestamp": now}
-        return True
-    
-    if request_counts[ip]["count"] >= MAX_REQUESTS_PER_HOUR:
-        return False
-    
-    request_counts[ip]["count"] += 1
-    return True
+    return {"total_found": total_found, "result_file": result_file}
 
 @app.route('/api/scrape', methods=['POST'])
 def start_scraping():
     """API endpoint to start scraping process"""
-    client_ip = request.remote_addr
-    
-    # Rate limiting check
-    if not check_rate_limit(client_ip):
-        return jsonify({
-            "status": "error",
-            "message": "Rate limit exceeded. Please try again later."
-        }), 429
-    
-    # Check if file was uploaded
     if 'file' not in request.files:
-        return jsonify({
-            "status": "error",
-            "message": "No file uploaded"
-        }), 400
+        return jsonify({"status": "error", "message": "No file uploaded"}), 400
     
     file = request.files['file']
-    
-    # Check if file is CSV
     if not file.filename.lower().endswith('.csv'):
-        return jsonify({
-            "status": "error",
-            "message": "Only CSV files are supported"
-        }), 400
+        return jsonify({"status": "error", "message": "Only CSV files are supported"}), 400
     
     # Save the file temporarily
     temp_csv = os.path.join(TEMP_FOLDER, f"upload_{uuid.uuid4().hex}.csv")
     file.save(temp_csv)
     
-    # Read MC numbers from CSV
     try:
         with open(temp_csv, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             if 'MC_NUMBER' not in reader.fieldnames:
-                os.remove(temp_csv)
-                return jsonify({
-                    "status": "error",
-                    "message": "CSV must have 'MC_NUMBER' column header"
-                }), 400
+                return jsonify({"status": "error", "message": "CSV must have 'MC_NUMBER' column"}), 400
             
             mc_numbers = [row['MC_NUMBER'].strip() for row in reader if row['MC_NUMBER'].strip()]
             
         if not mc_numbers:
-            os.remove(temp_csv)
-            return jsonify({
-                "status": "error",
-                "message": "No valid MC numbers found in the CSV"
-            }), 400
+            return jsonify({"status": "error", "message": "No valid MC numbers found"}), 400
         
-        # Generate job ID
         job_id = uuid.uuid4().hex
-        
-        # Start processing in background thread
         threading.Thread(
             target=process_mc_numbers,
             args=(mc_numbers, job_id),
             daemon=True
         ).start()
         
-        # Clean up the uploaded CSV
-        os.remove(temp_csv)
-        
         return jsonify({
             "status": "success",
             "job_id": job_id,
-            "message": f"Processing started for {len(mc_numbers)} MC numbers"
+            "message": f"Processing {len(mc_numbers)} MC numbers"
         })
-    
+        
     except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
         if os.path.exists(temp_csv):
             os.remove(temp_csv)
-        return jsonify({
-            "status": "error",
-            "message": f"Error processing file: {str(e)}"
-        }), 500
 
 @app.route('/api/status/<job_id>', methods=['GET'])
 def check_status(job_id):
     """Check status of a scraping job"""
     result_file = os.path.join(TEMP_FOLDER, f"{job_id}.xlsx")
-    
     if os.path.exists(result_file):
         return jsonify({
             "status": "completed",
@@ -295,12 +214,8 @@ def check_status(job_id):
 def download_results(job_id):
     """Download the results Excel file"""
     result_file = os.path.join(TEMP_FOLDER, f"{job_id}.xlsx")
-    
     if not os.path.exists(result_file):
-        return jsonify({
-            "status": "error",
-            "message": "Result file not found"
-        }), 404
+        return jsonify({"status": "error", "message": "Result file not found"}), 404
     
     return send_file(
         result_file,
@@ -309,32 +224,6 @@ def download_results(job_id):
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
 
-@app.route('/api/cleanup', methods=['POST'])
-def cleanup():
-    """Cleanup old temporary files (admin endpoint)"""
-    if not request.headers.get('X-Admin-Key') == os.getenv('ADMIN_KEY', 'secret'):
-        return jsonify({"status": "error", "message": "Unauthorized"}), 401
-    
-    try:
-        cleanup_temp_files()
-        return jsonify({
-            "status": "success",
-            "message": "Cleanup completed"
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Cleanup failed: {str(e)}"
-        }), 500
-
 if __name__ == '__main__':
-    # Start cleanup thread
-    def cleanup_scheduler():
-        while True:
-            time.sleep(CLEANUP_INTERVAL)
-            cleanup_temp_files()
-    
-    threading.Thread(target=cleanup_scheduler, daemon=True).start()
-    
-    # Run the app
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
