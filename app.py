@@ -28,7 +28,7 @@ if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 def init_driver():
-    """Initialize Chrome with Render-specific settings"""
+    """Initialize Chrome with Render-specific fixes"""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-gpu")
@@ -36,20 +36,28 @@ def init_driver():
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920x1080")
     
-    # Critical for Render
+    # CRITICAL FOR RENDER
     chrome_options.add_argument("--remote-debugging-port=9222")
-    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--no-zygote")
+    chrome_options.add_argument("--single-process")
     
-    # Anti-bot measures
+    # Anti-detection
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    return driver
+    try:
+        # Explicit ChromeDriver installation
+        driver_path = ChromeDriverManager().install()
+        service = Service(executable_path=driver_path)
+        
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+        return driver
+    except Exception as e:
+        print(f"DRIVER INIT ERROR: {str(e)}")
+        raise
 
 @app.route('/scrape', methods=['POST'])
 def handle_scrape():
@@ -69,43 +77,46 @@ def handle_scrape():
         if not mc_numbers:
             return jsonify({"error": "No valid MC numbers found"}), 400
         
-        # Setup Excel
+        # Initialize Excel
         result_file = f"{TEMP_FOLDER}/{uuid.uuid4()}.xlsx"
         workbook = Workbook()
         sheet = workbook.active
         sheet.append(["MC Number", "Company Name", "Phone", "Address", "Status"])
         
-        # Scrape data
+        # Initialize driver
         driver = init_driver()
         found = 0
         
         for mc in mc_numbers:
             try:
+                # 1. Load page
                 driver.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
                 
-                # Search by MC number
+                # 2. Select MC search
                 WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-                    EC.element_to_be_clickable((By.XPATH, '//input[@value="MC"]'))).click()
+                    EC.element_to_be_clickable((By.XPATH, '//input[@value="MC" and @type="radio"]'))).click()
                 
+                # 3. Enter MC number
                 search_box = WebDriverWait(driver, ELEMENT_TIMEOUT).until(
                     EC.presence_of_element_located((By.XPATH, '//input[@name="snapshot_id"]')))
                 search_box.clear()
                 search_box.send_keys(mc)
                 
+                # 4. Submit
                 WebDriverWait(driver, ELEMENT_TIMEOUT).until(
                     EC.element_to_be_clickable((By.XPATH, '//input[@type="submit"]'))).click()
                 
-                # Extract data
+                # 5. Extract data
                 data = {
                     "MC Number": mc,
-                    "Company Name": driver.find_element(
-                        By.XPATH, '//td[contains(text(), "Legal Name")]/following-sibling::td').text,
-                    "Phone": driver.find_element(
-                        By.XPATH, '//td[contains(text(), "Phone")]/following-sibling::td').text,
-                    "Address": driver.find_element(
-                        By.XPATH, '//td[contains(text(), "Physical Address")]/following-sibling::td').text,
-                    "Status": driver.find_element(
-                        By.XPATH, '//td[contains(text(), "Operating Status")]/following-sibling::td').text
+                    "Company Name": WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                        EC.presence_of_element_located((By.XPATH, '//td[contains(., "Legal Name")]/following-sibling::td'))).text,
+                    "Phone": WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                        EC.presence_of_element_located((By.XPATH, '//td[contains(., "Phone")]/following-sibling::td'))).text,
+                    "Address": WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                        EC.presence_of_element_located((By.XPATH, '//td[contains(., "Physical Address")]/following-sibling::td'))).text,
+                    "Status": WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                        EC.presence_of_element_located((By.XPATH, '//td[contains(., "Operating Status")]/following-sibling::td'))).text
                 }
                 
                 if "AUTHORIZED" in data["Status"].upper():
