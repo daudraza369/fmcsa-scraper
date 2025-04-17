@@ -18,44 +18,49 @@ if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 def scrape_with_requests(mc_number):
-    """Scrape FMCSA data using requests and BeautifulSoup"""
+    """Updated scraping function with current FMCSA selectors"""
     try:
         with requests.Session() as session:
-            # 1. Get initial page to obtain VIEWSTATE
-            response = session.get(FMCSA_URL)
+            # 1. Get initial page
+            response = session.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
             soup = BeautifulSoup(response.text, 'html.parser')
-            viewstate = soup.find('input', {'name': '__VIEWSTATE'})['value']
             
-            # 2. Prepare form data
+            # 2. Prepare form data with all required fields
             form_data = {
-                '__VIEWSTATE': viewstate,
-                'ctl00$MainContent$btnSearch': 'Search',
+                '__VIEWSTATE': soup.find('input', {'name': '__VIEWSTATE'})['value'],
+                '__VIEWSTATEGENERATOR': soup.find('input', {'name': '__VIEWSTATEGENERATOR'})['value'],
+                '__EVENTVALIDATION': soup.find('input', {'name': '__EVENTVALIDATION'})['value'],
+                'ctl00$MainContent$searchType': 'MC',
                 'ctl00$MainContent$txtMC': mc_number,
-                'ctl00$MainContent$searchType': 'MC'
+                'ctl00$MainContent$btnSearch': 'Search'
             }
             
             # 3. Submit search
-            response = session.post(FMCSA_URL, data=form_data)
+            response = session.post("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx", 
+                                  data=form_data,
+                                  headers={
+                                      'Content-Type': 'application/x-www-form-urlencoded',
+                                      'User-Agent': 'Mozilla/5.0'
+                                  })
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # 4. Extract data
+            # 4. Updated selectors (July 2024)
             return {
                 "MC Number": mc_number,
-                "Company Name": extract_text(soup, 'Legal Name'),
-                "Phone": extract_text(soup, 'Phone'),
-                "Address": extract_text(soup, 'Physical Address'),
-                "Status": extract_text(soup, 'Operating Status')
+                "Company Name": extract_text(soup, 'Legal Name:', 'td'),
+                "Phone": extract_text(soup, 'Phone:', 'td'),
+                "Address": extract_text(soup, 'Physical Address:', 'td'),
+                "Status": extract_text(soup, 'Operating Status:', 'td')
             }
-            
     except Exception as e:
         print(f"Error scraping {mc_number}: {str(e)}")
         return None
 
-def extract_text(soup, field_name):
-    """Helper to extract field data"""
+def extract_text(soup, text, tag='td'):
+    """More robust text extraction"""
     try:
-        td = soup.find('td', string=lambda t: field_name in str(t))
-        return td.find_next_sibling('td').get_text(strip=True)
+        element = soup.find(tag, string=lambda t: text in str(t))
+        return element.find_next(tag).get_text(strip=True) if element else "NOT FOUND"
     except:
         return "NOT FOUND"
 
