@@ -12,13 +12,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from openpyxl import Workbook
 import os
 import uuid
+import logging
 
 # Configuration
 os.environ['WDM_LOG_LEVEL'] = '0'
 os.environ['WDM_LOCAL'] = '1'
 PAGE_LOAD_TIMEOUT = 30
 ELEMENT_TIMEOUT = 15
-DELAY = 3.0  # Critical for Render's free tier
+DELAY = 3.0
 TEMP_FOLDER = "temp_results"
 
 app = Flask(__name__)
@@ -28,67 +29,67 @@ if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 def init_driver():
-    """Chrome setup optimized for Render"""
+    """Initialize Chrome with anti-bot measures"""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920x1080")
-    
-    # Anti-detection measures
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
-    
-    # Mask selenium
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
 
-def scrape_data(mc, driver):
-    """Robust scraping function with current FMCSA selectors"""
+def scrape_mc(mc, driver):
+    """Scrape data for a single MC number"""
     try:
-        # 1. Load page
+        # Load page
         driver.get("https://safer.fmcsa.dot.gov/CompanySnapshot.aspx")
         
-        # 2. Select MC search
+        # Select MC search
         WebDriverWait(driver, ELEMENT_TIMEOUT).until(
             EC.element_to_be_clickable((By.XPATH, '//input[@value="MC"]'))).click()
         
-        # 3. Enter MC number
+        # Enter MC number
         search_box = WebDriverWait(driver, ELEMENT_TIMEOUT).until(
             EC.presence_of_element_located((By.XPATH, '//input[@name="snapshot_id"]')))
         search_box.clear()
         search_box.send_keys(mc)
         
-        # 4. Submit search
+        # Submit search
         WebDriverWait(driver, ELEMENT_TIMEOUT).until(
             EC.element_to_be_clickable((By.XPATH, '//input[@type="submit"]'))).click()
         
-        # 5. Wait for results
+        # Wait for results
         WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-            EC.presence_of_element_located((By.XPATH, '//h2[contains(text(), "Company Snapshot")]'))
+            EC.presence_of_element_located((By.XPATH, '//h2[contains(text(), "Company Snapshot")]')))
         
-        # 6. Extract data - Updated 2024 selectors
+        # Extract data
         return {
             "MC Number": mc,
-            "Company Name": driver.find_element(By.XPATH, '//td[contains(text(), "Legal Name")]/following-sibling::td').text.strip(),
-            "Phone": driver.find_element(By.XPATH, '//td[contains(text(), "Phone")]/following-sibling::td').text.strip(),
-            "Address": driver.find_element(By.XPATH, '//td[contains(text(), "Physical Address")]/following-sibling::td').text.strip(),
-            "Status": driver.find_element(By.XPATH, '//td[contains(text(), "Operating Status")]/following-sibling::td').text.strip()
+            "Company Name": driver.find_element(
+                By.XPATH, '//td[contains(text(), "Legal Name")]/following-sibling::td').text.strip(),
+            "Phone": driver.find_element(
+                By.XPATH, '//td[contains(text(), "Phone")]/following-sibling::td').text.strip(),
+            "Address": driver.find_element(
+                By.XPATH, '//td[contains(text(), "Physical Address")]/following-sibling::td').text.strip(),
+            "Status": driver.find_element(
+                By.XPATH, '//td[contains(text(), "Operating Status")]/following-sibling::td').text.strip()
         }
         
     except Exception as e:
-        print(f"Error scraping {mc}: {str(e)}")
+        logging.error(f"Error scraping MC {mc}: {str(e)}")
         return None
 
 @app.route('/scrape', methods=['POST'])
 def handle_scrape():
-    """Fixed API endpoint"""
+    """API endpoint to start scraping"""
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     
@@ -99,11 +100,12 @@ def handle_scrape():
     try:
         # Read CSV
         mc_numbers = []
-        reader = csv.DictReader(file.read().decode('utf-8').splitlines())
+        content = file.read().decode('utf-8').splitlines()
+        reader = csv.DictReader(content)
         mc_numbers = [row['MC_NUMBER'].strip() for row in reader if row.get('MC_NUMBER')]
         
         if not mc_numbers:
-            return jsonify({"error": "No valid MC numbers"}), 400
+            return jsonify({"error": "No valid MC numbers found"}), 400
         
         # Setup Excel
         result_file = f"{TEMP_FOLDER}/{uuid.uuid4()}.xlsx"
@@ -111,15 +113,15 @@ def handle_scrape():
         sheet = workbook.active
         sheet.append(["MC Number", "Company Name", "Phone", "Address", "Status"])
         
-        # Scrape with single driver
+        # Scrape data
         driver = init_driver()
         found = 0
         
         for mc in mc_numbers:
-            data = scrape_data(mc, driver)
+            data = scrape_mc(mc, driver)
             if data and "AUTHORIZED" in data["Status"].upper():
-                sheet.append([data["MC Number"], data["Company Name"], data["Phone"], 
-                            data["Address"], data["Status"]])
+                sheet.append([data["MC Number"], data["Company Name"], 
+                            data["Phone"], data["Address"], data["Status"]])
                 found += 1
             time.sleep(DELAY)  # Critical delay
             
@@ -137,12 +139,11 @@ def handle_scrape():
 
 @app.route('/download/<filename>', methods=['GET'])
 def handle_download(filename):
-    """Download endpoint"""
+    """Download results"""
     try:
         return send_file(
             f"{TEMP_FOLDER}/{filename}",
             as_attachment=True,
-            download_name="fmcsa_results.xlsx",
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
     except FileNotFoundError:
